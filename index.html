@@ -59,7 +59,9 @@
   #setup .card { background: var(--body); border-radius: 16px; padding: 22px; width: min(88vw, 400px); text-align: center; }
   #setup h1 { font-size: 20px; margin: 0 0 8px; }
   #setup p { color: var(--dim); font-size: 14px; line-height: 1.45; margin: 0 0 16px; }
-  #setup button { width: 100%; padding: 15px; border: 0; border-radius: 10px; background: var(--btn); color: var(--txt); font-size: 17px; }
+  .vh { position: fixed; left: -9999px; width: 1px; height: 1px; opacity: 0; }
+  #setup .btn { display: block; box-sizing: border-box; cursor: pointer; }
+  #setup button, #setup .btn { width: 100%; padding: 15px; border: 0; border-radius: 10px; background: var(--btn); color: var(--txt); font-size: 17px; }
   #setup .err { color: #ff8a8a; min-height: 1.4em; margin: 12px 0 0; }
   @media (orientation: landscape) {
     #wrap { top: 0; bottom: 0; align-items: center; }
@@ -111,13 +113,13 @@
     <h1>Pokémon Prisma Edition</h1>
     <p>Wähle einmalig deine Prisma-Spieldatei (.gb/.gbc) aus, zum Beispiel aus der Dateien-App.
        Sie bleibt danach nur auf diesem Gerät gespeichert.</p>
-    <button id="pickRom">Spieldatei auswählen</button>
+    <label id="pickRom" for="romFile" class="btn">Spieldatei auswählen</label>
     <p class="err" id="setupErr"></p>
   </div>
 </div>
 <div id="toast"></div>
-<input type="file" id="file" hidden>
-<input type="file" id="romFile" hidden>
+<input type="file" id="file" class="vh">
+<input type="file" id="romFile" class="vh">
 <script src="app.js"></script>
 </body>
 </html>

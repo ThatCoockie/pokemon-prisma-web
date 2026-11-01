@@ -62,10 +62,13 @@ const SIG_MAGIC = 'PRISMASIG1';
 async function isPrisma(rom) {
   try {
     if (rom.length < 0x8000 || rom.length % 0x4000) return false;
-    const tail = rom.subarray(rom.length - 80);
+    // Signatur am Dateiende, bei der Zeitreise-Datei (Kanto + Johto) am Ende der Kanto-Haelfte
+    const both = rom.length >= 0x400000 && String.fromCharCode.apply(null, rom.subarray(0x200134, 0x20013e)) === 'PM_CRYSTAL';
+    const at = both ? 0x200000 - 80 : rom.length - 80;
+    const tail = rom.subarray(at, at + 80);
     if (String.fromCharCode.apply(null, tail.subarray(0, 10)) !== SIG_MAGIC) return false;
     const sig = tail.slice(16, 80);
-    const msg = rom.slice(); msg.fill(0, rom.length - 80); msg[0x14e] = 0; msg[0x14f] = 0;
+    const msg = rom.slice(); msg.fill(0, at, at + 80); msg[0x14e] = 0; msg[0x14f] = 0;
     const key = await crypto.subtle.importKey('jwk', PRISMA_KEY, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
     return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, msg);
   } catch (e) { return false; }
@@ -101,7 +104,7 @@ function askRom(message) {
   document.getElementById('hint').hidden = true;
   return new Promise((resolve) => {
     const input = document.getElementById('romFile');
-    document.getElementById('pickRom').onclick = () => { input.value = ''; input.click(); };
+    input.value = '';
     input.onchange = async () => {
       const f = input.files[0]; if (!f) return;
       const rom = new Uint8Array(await f.arrayBuffer());
@@ -133,8 +136,16 @@ async function startCore() {
   new Uint8Array(mem(), p, rom.length).set(rom);
   sramSize = core.wc_init();
   try { saveCache = await DB.get('sav'); } catch (e) { saveCache = null; }
-  if (saveCache && saveCache.length >= sramSize) sramView().set(saveCache.subarray(0, sramSize));
+  // auch alte, kleinere Spielstaende (32 KB Kanto) uebernehmen
+  if (saveCache && saveCache.length) sramView().set(saveCache.subarray(0, Math.min(sramSize, saveCache.length)));
+  setClock();
+  if (core.wc_start() < 0) throw new Error('Spieldatei konnte nicht gestartet werden');
   core.wc_sram_dirty();
+}
+// Ortszeit fuer die Uhr in Johto (Kristall)
+function setClock() {
+  const now = new Date();
+  core.wc_set_time(Math.floor(now.getTime() / 1000) - now.getTimezoneOffset() * 60);
 }
 let blockPersist = false;
 function persist() {
@@ -228,7 +239,7 @@ function updateTouches(e) {
 for (const ev of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
   document.addEventListener(ev, (e) => {
     startAudio();
-    if (e.target.closest && (e.target.closest('#menu') || e.target.closest('#menuBtn'))) return;
+    if (e.target.closest && (e.target.closest('#menu') || e.target.closest('#menuBtn') || e.target.closest('#setup'))) return;
     e.preventDefault();
     updateTouches(e);
   }, { passive: false });
@@ -323,8 +334,8 @@ document.getElementById('mRom').addEventListener('click', async () => {
 document.getElementById('file').addEventListener('change', async (e) => {
   const f = e.target.files[0]; if (!f) return;
   const b = new Uint8Array(await f.arrayBuffer());
-  if (b.length < sramSize || b.length > 262144) { toast('Das ist kein passender Spielstand (.sav).'); return; }
-  await DB.put('sav', b.slice(0, Math.max(sramSize, 32768)));
+  if (b.length < 32768 || b.length > 262144) { toast('Das ist kein passender Spielstand (.sav).'); return; }
+  await DB.put('sav', b.slice(0, Math.max(sramSize, 32768)));   // alter Kanto-Spielstand (32 KB) passt auch
   blockPersist = true; location.reload();
 });
 volume = loadSetting('volume', loadSetting('sound', 1) ? 100 : 0);   // alte Einstellung "Ton aus" uebernehmen
