@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Pokémon Prisma Edition</title>
+<meta name="theme-color" content="#1b1d26">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Prisma">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root { --bg: #1b1d26; --body: #2a2d3a; --btn: #8e2246; --btn-on: #c43a66; --dir: #3a3e4e; --dir-on: #5a6078; --txt: #e8ecf0; --dim: #8890a0; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--txt); font-family: system-ui, sans-serif;
+    overflow: hidden; user-select: none; -webkit-user-select: none; touch-action: none; }
+  #wrap { position: absolute; left: 0; right: 0; top: env(safe-area-inset-top, 0); display: flex; justify-content: center; }
+  #lcd { width: 100vw; max-width: calc(58vh * 160 / 144); aspect-ratio: 160 / 144; image-rendering: pixelated; background: #000; display: block; }
+  #controls { position: absolute; left: 0; right: 0; bottom: 0; top: calc(env(safe-area-inset-top, 0px) + min(100vw, 58vh * 160 / 144) * 144 / 160); }
+  #dpad { position: absolute; left: 6vw; top: 50%; width: min(42vw, 30vh); height: min(42vw, 30vh); transform: translateY(-62%); }
+  #dpad .arm { position: absolute; background: var(--dir); border-radius: 8px; }
+  #dpad .h { left: 0; right: 0; top: 33.3%; height: 33.4%; }
+  #dpad .v { top: 0; bottom: 0; left: 33.3%; width: 33.4%; }
+  #dpad .hl { position: absolute; width: 33.4%; height: 33.4%; border-radius: 8px; }
+  #dpad .hl.on { background: var(--dir-on); }
+  #hlU { left: 33.3%; top: 0; } #hlD { left: 33.3%; bottom: 0; } #hlL { left: 0; top: 33.3%; } #hlR { right: 0; top: 33.3%; }
+  .btn { position: absolute; width: min(17vw, 12vh); height: min(17vw, 12vh); border-radius: 50%; background: var(--btn);
+    display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: min(6vw, 4vh); box-shadow: 0 3px 0 #0006; }
+  .btn.on { background: var(--btn-on); transform: translateY(2px); box-shadow: none; }
+  #btnA { right: 5vw; top: 50%; transform: translateY(-95%); }
+  #btnB { right: calc(9vw + min(17vw, 12vh)); top: 50%; transform: translateY(-45%); }
+  #btnA.on { transform: translateY(-93%); } #btnB.on { transform: translateY(-43%); }
+  .pill { position: absolute; bottom: calc(5vh + env(safe-area-inset-bottom, 0px)); padding: 1.4vh 4vw; border-radius: 99px; background: var(--dir);
+    font-size: min(3.4vw, 2.2vh); letter-spacing: .08em; color: var(--txt); }
+  .pill.on { background: var(--dir-on); }
+  #btnSel { left: 22vw; } #btnStart { right: 22vw; }
+  #menuBtn { position: absolute; right: 3vw; top: 1.5vh; width: 11vw; max-width: 54px; aspect-ratio: 1; border-radius: 12px; background: var(--dir);
+    display: flex; align-items: center; justify-content: center; font-size: 6vw; color: var(--txt); }
+  #hint { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: var(--dim); font-size: 14px; pointer-events: none; }
+  #menu { position: fixed; inset: 0; background: #000c; display: flex; align-items: center; justify-content: center; z-index: 10; }
+  #menu[hidden] { display: none; }
+  #menu .card { background: var(--body); border-radius: 16px; padding: 20px; width: min(86vw, 380px); }
+  #menu h1 { font-size: 18px; margin: 0 0 4px; } #menu p { color: var(--dim); font-size: 13px; margin: 0 0 14px; line-height: 1.4; }
+  #menu button { display: block; width: 100%; margin: 8px 0; padding: 14px; border: 0; border-radius: 10px; background: var(--dir);
+    color: var(--txt); font-size: 16px; text-align: left; }
+  #menu button.main { background: var(--btn); }
+  #menu button[hidden] { display: none; }
+  #menu .card { max-height: 92vh; overflow-y: auto; }
+  #menu .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
+  #menu .grid button { font-size: 14px; padding: 12px 6px; }
+  #toast { position: fixed; left: 50%; bottom: 20vh; transform: translateX(-50%); background: #000d; padding: 10px 16px; border-radius: 10px;
+    font-size: 14px; z-index: 20; opacity: 0; transition: opacity .3s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  #setup { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 15; padding: 24px; }
+  #setup[hidden] { display: none; }
+  #setup .card { background: var(--body); border-radius: 16px; padding: 22px; width: min(88vw, 400px); text-align: center; }
+  #setup h1 { font-size: 20px; margin: 0 0 8px; }
+  #setup p { color: var(--dim); font-size: 14px; line-height: 1.45; margin: 0 0 16px; }
+  #setup button { width: 100%; padding: 15px; border: 0; border-radius: 10px; background: var(--btn); color: var(--txt); font-size: 17px; }
+  #setup .err { color: #ff8a8a; min-height: 1.4em; margin: 12px 0 0; }
+  @media (orientation: landscape) {
+    #wrap { top: 0; bottom: 0; align-items: center; }
+    #lcd { width: auto; height: 100vh; max-width: none; }
+    #controls { top: 0; }
+    #dpad { left: 4vw; top: 55%; width: 32vh; height: 32vh; transform: translateY(-50%); }
+    .btn { width: 15vh; height: 15vh; font-size: 5vh; }
+    #btnA { right: 4vw; top: 45%; transform: translateY(-50%); } #btnA.on { transform: translateY(-48%); }
+    #btnB { right: calc(6vw + 15vh); top: 62%; transform: translateY(-50%); } #btnB.on { transform: translateY(-48%); }
+    .pill { bottom: 4vh; font-size: 2.6vh; padding: 1.4vh 2.4vw; }
+    #btnSel { left: 6vw; } #btnStart { right: 6vw; }
+    #menuBtn { width: 9vh; font-size: 5vh; }
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="lcd" width="160" height="144"></canvas></div>
+<div id="controls">
+  <div id="dpad"><div class="arm h"></div><div class="arm v"></div>
+    <div class="hl" id="hlU"></div><div class="hl" id="hlD"></div><div class="hl" id="hlL"></div><div class="hl" id="hlR"></div></div>
+  <div class="btn" id="btnB">B</div>
+  <div class="btn" id="btnA">A</div>
+  <div class="pill" id="btnSel">SELECT</div>
+  <div class="pill" id="btnStart">START</div>
+  <div id="menuBtn">☰</div>
+</div>
+<div id="hint">Lädt …</div>
+<div id="menu" hidden>
+  <div class="card">
+    <h1>Pokémon Prisma Edition</h1>
+    <p>Web-Version · Speichere im Spiel über SICHERN, der Spielstand bleibt auf diesem Gerät.
+       Exportiere ihn ab und zu als Sicherung. B gedrückt halten = rennen.</p>
+    <button class="main" id="mResume">Weiterspielen</button>
+    <div class="grid">
+      <button id="mVolume">Lautstärke: 100 %</button>
+      <button id="mBright">Helligkeit: 100 %</button>
+      <button id="mGfx">Grafik: scharf</button>
+      <button id="mSpeed">Tempo: 1x</button>
+    </div>
+    <button id="mReset">Neustart</button>
+    <button id="mExport">Spielstand exportieren (.sav)</button>
+    <button id="mImport">Spielstand importieren (.sav)</button>
+    <button id="mRom">Neue Spieldatei laden (Update)</button>
+    <button id="mQuit" hidden>App beenden</button>
+  </div>
+</div>
+<div id="setup" hidden>
+  <div class="card">
+    <h1>Pokémon Prisma Edition</h1>
+    <p>Wähle einmalig deine Prisma-Spieldatei (.gb/.gbc) aus, zum Beispiel aus der Dateien-App.
+       Sie bleibt danach nur auf diesem Gerät gespeichert.</p>
+    <button id="pickRom">Spieldatei auswählen</button>
+    <p class="err" id="setupErr"></p>
+  </div>
+</div>
+<div id="toast"></div>
+<input type="file" id="file" hidden>
+<input type="file" id="romFile" hidden>
+<script src="app.js"></script>
+</body>
+</html>
