@@ -59,6 +59,17 @@ const Bridge = {
 // Jede Prisma-Spieldatei traegt am Ende eine Signatur (ECDSA P-256). Hier liegt nur der oeffentliche Schluessel.
 const PRISMA_KEY = { kty: 'EC', crv: 'P-256', x: 'eb-NpigE1AL0i7inRcun8QHXuJSeBBa6cRPrx3aEh5Q', y: 'Lwqj_eU5YQW3QNg-xsEm5gkRt5q1y44VegiPkSD3DVg' };
 const SIG_MAGIC = 'PRISMASIG1';
+// Prisma-Spieldatei (.prisma): verschluesselt, nur dieser Emulator liest sie. Hier entpacken (gleich wie pl_unpack in C).
+// Eine echte .gb/.gbc bleibt unveraendert, damit alte Dateien weiter funktionieren.
+const PRISMA_FILE_MAGIC = 'PRISMA\x1aGAME\x00';
+function unpackPrisma(buf) {
+  if (buf.length < 64 || String.fromCharCode.apply(null, buf.subarray(0, 12)) !== PRISMA_FILE_MAGIC) return buf;
+  const n = (buf[16] | buf[17] << 8 | buf[18] << 16 | buf[19] << 24) >>> 0;
+  if (n > buf.length - 64) return buf;
+  const out = new Uint8Array(n); let x = 0x5052534D >>> 0;
+  for (let i = 0; i < n; i++) { x = (Math.imul(x, 1103515245) + 12345) >>> 0; out[i] = buf[64 + i] ^ ((x >>> 16) & 0xff); }
+  return out;
+}
 async function isPrisma(rom) {
   try {
     if (rom.length < 0x8000 || rom.length % 0x4000) return false;
@@ -107,7 +118,7 @@ function askRom(message) {
     input.value = '';
     input.onchange = async () => {
       const f = input.files[0]; if (!f) return;
-      const rom = new Uint8Array(await f.arrayBuffer());
+      const rom = unpackPrisma(new Uint8Array(await f.arrayBuffer()));
       if (!(await isPrisma(rom))) {
         document.getElementById('setupErr').textContent = 'Dieser Emulator spielt ausschließlich Pokémon Prisma. Bitte wähle die Prisma-Spieldatei aus.';
         return;
@@ -324,7 +335,7 @@ document.getElementById('mRom').addEventListener('click', async () => {
   input.value = '';
   input.onchange = async () => {
     const f = input.files[0]; if (!f) return;
-    const rom = new Uint8Array(await f.arrayBuffer());
+    const rom = unpackPrisma(new Uint8Array(await f.arrayBuffer()));
     if (!(await isPrisma(rom))) { toast('Dieser Emulator spielt ausschließlich Pokémon Prisma.'); return; }
     await DB.put('rom', rom);
     blockPersist = true; location.reload();
