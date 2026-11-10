@@ -146,6 +146,7 @@ async function startCore() {
   const p = core.wc_rom_alloc(rom.length);
   new Uint8Array(mem(), p, rom.length).set(rom);
   sramSize = core.wc_init();
+  if (window.PrismaNet) window.PrismaNet.attach(core, mem, p, rom.length);   // Mitspielen: Spiel-Kennung + Figuren aus dem entpackten ROM
   try { saveCache = await DB.get('sav'); } catch (e) { saveCache = null; }
   // auch alte, kleinere Spielstaende (32 KB Kanto) uebernehmen
   if (saveCache && saveCache.length) sramView().set(saveCache.subarray(0, Math.min(sramSize, saveCache.length)));
@@ -170,6 +171,7 @@ const ctx2d = canvas.getContext('2d');
 function draw() {
   core.wc_compose();
   const px = new Uint8ClampedArray(mem(), core.wc_screen(), 160 * 144 * 4);
+  if (window.PrismaNet) window.PrismaNet.draw(px);   // Mitspieler ueber das Bild
   ctx2d.putImageData(new ImageData(px, 160, 144), 0, 0);
 }
 
@@ -261,12 +263,14 @@ const keyMap = {
   x: 'A', k: 'A', ' ': 'A', y: 'B', z: 'B', l: 'B', Enter: 'START', Backspace: 'SELECT', Shift: 'SELECT',
 };
 document.addEventListener('keydown', (e) => {
+  if (window.PrismaNet && window.PrismaNet.isTyping(e)) return;   // Tippen im Chat geht nicht ans Spiel
   startAudio();
   if (e.key === 'Escape') { toggleMenu(); return; }
   const k = keyMap[e.key] || keyMap[e.key.toLowerCase()];
   if (k) { keyBits |= KEY[k]; e.preventDefault(); }
 });
 document.addEventListener('keyup', (e) => {
+  if (window.PrismaNet && window.PrismaNet.isTyping(e)) return;   // Tippen im Chat geht nicht ans Spiel
   const k = keyMap[e.key] || keyMap[e.key.toLowerCase()];
   if (k) keyBits &= ~KEY[k];
 });
@@ -364,6 +368,7 @@ window.onExported = (ok) => toast(ok ? 'Spielstand exportiert.' : 'Export abgebr
 let last = performance.now(), acc = 0;
 function step() {
   for (let i = 0; i < speed; i++) { core.wc_frame(buttons()); if (i === 0) pushAudio(); }   // schneller: Ton nur vom ersten Bild
+  if (window.PrismaNet) window.PrismaNet.tick();
 }
 function tick(now) {
   let dt = now - last; last = now;
