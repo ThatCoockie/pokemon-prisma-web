@@ -1,6 +1,7 @@
-// Prisma: Mitspielen ohne eigenen Server (WebRTC). Ein Spieler eroeffnet als Host eine Runde, Freunde treten per
-// Einladungs-Code bei und schicken einen Antwort-Code zurueck. Der Host verteilt Online-Liste und Chat an alle.
-// STUN (oeffentlich) hilft nur beim Finden der Geraete; danach laufen die Daten direkt zwischen den Spielern.
+// Prisma: Mitspielen ohne eigenen Server (WebRTC). Jeder hat einen festen Freundes-Code; Freunde sehen sich in der
+// Freundesliste, einer eroeffnet als Host eine Runde, die anderen treten mit einem Tipp bei. Die Geraete finden sich ueber
+// einen kostenlosen oeffentlichen Vermittlungsdienst (verschluesselt); STUN hilft beim Verbinden. Danach laufen die Daten
+// direkt zwischen den Spielern. Notloesung ohne Vermittlung: Codes per Hand tauschen. Der Host verteilt Liste und Chat.
 // Gemeinsam fuer Web-App und Android (gleiche Datei). Spielstaende werden nie verschickt.
 (function () {
   'use strict';
@@ -226,11 +227,238 @@
     try { const o = JSON.parse(data); return o && typeof o === 'object' && typeof o.t === 'string' ? o : null; } catch (e) { return null; }
   }
 
+  // ---------------- Vermittlung (automatisch, ohne eigenen Server) ----------------
+  // Treffpunkt: kostenloser oeffentlicher MQTT-Dienst (HiveMQ, WebSocket). Darueber laufen nur Online-Status und die
+  // Verbindungsbeschreibungen, verschluesselt mit AES-GCM; Schluessel und Themen werden aus dem Freundes-Code abgeleitet,
+  // der Dienst sieht nur Datensalat. Gleiches Verfahren in der PC-Exe (prisma_net.c). Kleines eigenes MQTT 3.1.1 (QoS 0).
+  const BROKER = 'wss://broker.hivemq.com:8884/mqtt';
+  const ALPHA = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';  // ohne 0/O, 1/I/L
+  const enc8 = new TextEncoder(), dec8 = new TextDecoder();
+  let myCode = loadCode();
+  let friends = loadFriends();                       // [{ code, name, online, host, g }]
+  let mq = null, mqUp = false, mqPid = 1, mqPing = null, mqTimer = null, mqDelay = 3000;
+  const tids = new Map(), keys = new Map();
+  const pendingByCode = new Map();                   // Host: Freundes-Code -> { pc, dc } (wartet auf Antwort)
+  let joinTarget = null;                             // Gast: Code des Hosts, bei dem wir beitreten
+
+  function loadCode() {
+    let c = '';
+    try { c = localStorage.getItem('prisma-code') || ''; } catch (e) {}
+    if (!/^[2-9A-HJKMNP-Z]{8}$/.test(c)) {
+      const r = new Uint8Array(8);
+      crypto.getRandomValues(r);
+      c = Array.from(r, (b) => ALPHA[b % ALPHA.length]).join('');
+      try { localStorage.setItem('prisma-code', c); } catch (e) {}
+    }
+    return c;
+  }
+  function loadFriends() {
+    try {
+      const a = JSON.parse(localStorage.getItem('prisma-friends') || '[]');
+      return Array.isArray(a) ? a.filter((f) => f && /^[2-9A-HJKMNP-Z]{8}$/.test(f.code)).slice(0, 50)
+        .map((f) => ({ code: f.code, name: cleanName(f.name), online: false, host: false, g: '' })) : [];
+    } catch (e) { return []; }
+  }
+  function saveFriends() {
+    try { localStorage.setItem('prisma-friends', JSON.stringify(friends.map((f) => ({ code: f.code, name: f.name })))); } catch (e) {}
+  }
+  function normCode(s) {
+    const c = String(s || '').toUpperCase().replace(/O/g, '0').split('').filter((ch) => ALPHA.includes(ch)).join('');
+    return c.length === 8 ? c : '';
+  }
+  function showCode(c) { return c.slice(0, 4) + '-' + c.slice(4); }
+  function friendOf(code) { return friends.find((f) => f.code === code); }
+  async function sha(str) { return new Uint8Array(await crypto.subtle.digest('SHA-256', enc8.encode(str))); }
+  async function tid(code) {
+    if (!tids.has(code)) tids.set(code, Array.from((await sha('prisma-topic:' + code)).slice(0, 12), (b) => b.toString(16).padStart(2, '0')).join(''));
+    return tids.get(code);
+  }
+  async function aes(code) {
+    if (!keys.has(code)) keys.set(code, await crypto.subtle.importKey('raw', await sha('prisma-key:' + code), 'AES-GCM', false, ['encrypt', 'decrypt']));
+    return keys.get(code);
+  }
+  async function seal(code, obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await aes(code), enc8.encode(JSON.stringify(obj))));
+    const out = new Uint8Array(12 + ct.length);
+    out.set(iv); out.set(ct, 12);
+    return out;
+  }
+  async function unseal(code, data) {
+    if (data.length < 28 || data.length > 20000) return null;
+    try {
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, await aes(code), data.slice(12));
+      const o = JSON.parse(dec8.decode(pt));
+      return o && typeof o === 'object' && typeof o.t === 'string' ? o : null;
+    } catch (e) { return null; }
+  }
+  const pTopic = async (code) => 'prisma1/p/' + await tid(code);
+  const iTopic = async (code) => 'prisma1/i/' + await tid(code);
+
+  // MQTT 3.1.1, nur was gebraucht wird: CONNECT (mit Testament = offline), SUBSCRIBE, PUBLISH QoS 0, PING
+  function mStr(s) { const b = enc8.encode(s); return [b.length >> 8, b.length & 255, ...b]; }
+  function mPacket(type, body) {
+    const len = []; let n = body.length;
+    do { let d = n % 128; n = Math.floor(n / 128); if (n) d |= 128; len.push(d); } while (n);
+    const out = new Uint8Array(1 + len.length + body.length);
+    out[0] = type; out.set(len, 1); out.set(body, 1 + len.length);
+    return out;
+  }
+  function mSend(type, body) { if (mq && mq.readyState === 1) mq.send(mPacket(type, body)); }
+  async function mPublish(topic, payload, retain) { mSend(0x30 | (retain ? 1 : 0), [...mStr(topic), ...payload]); }
+  async function mSubscribe(topic) { const id = mqPid++ & 0xffff || 1; mSend(0x82, [id >> 8, id & 255, ...mStr(topic), 0]); }
+  function netWanted() { try { return localStorage.getItem('prisma-net-on') === '1'; } catch (e) { return false; } }
+  function mqConnect() {
+    if (mq || !netWanted() || !crypto.subtle || typeof WebSocket !== 'function') return;
+    let ws, buf = new Uint8Array(0);
+    try { ws = new WebSocket(BROKER, 'mqtt'); } catch (e) { mqRetry(); return; }
+    ws.binaryType = 'arraybuffer';
+    mq = ws;
+    ws.onopen = async () => {
+      const cid = 'prisma-' + Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, '0')).join('');
+      // Saubere Sitzung, Testament: leere, gemerkte Online-Meldung (= offline), Lebenszeichen alle 60 s
+      mSend(0x10, [...mStr('MQTT'), 4, 0x02 | 0x04 | 0x20, 0, 60, ...mStr(cid), ...mStr(await pTopic(myCode)), 0, 0]);
+    };
+    ws.onmessage = (ev) => {
+      const add = new Uint8Array(ev.data), nb = new Uint8Array(buf.length + add.length);
+      nb.set(buf); nb.set(add, buf.length); buf = nb;
+      for (;;) {
+        if (buf.length < 2) break;
+        let rl = 0, mul = 1, i = 1;
+        for (; i < 5 && i < buf.length; i++) { rl += (buf[i] & 127) * mul; mul *= 128; if (!(buf[i] & 128)) break; }
+        if (i >= buf.length || (buf[i] & 128)) break;
+        const total = i + 1 + rl;
+        if (buf.length < total) break;
+        mHandle(buf[0], buf.slice(i + 1, total));
+        buf = buf.slice(total);
+      }
+    };
+    ws.onclose = () => {
+      if (mq === ws) { mq = null; mqUp = false; }
+      clearInterval(mqPing); mqPing = null;
+      for (const f of friends) { f.online = false; f.host = false; }
+      render();
+      mqRetry();
+    };
+    ws.onerror = () => {};
+  }
+  function mqRetry() {
+    clearTimeout(mqTimer);
+    mqTimer = setTimeout(mqConnect, mqDelay);
+    mqDelay = Math.min(mqDelay * 2, 60000);
+  }
+  async function mHandle(type, body) {
+    const kind = type >> 4;
+    if (kind === 2) {                                // CONNACK
+      if (body[1] !== 0) { try { mq.close(); } catch (e) {} return; }
+      mqUp = true; mqDelay = 3000;
+      clearInterval(mqPing); mqPing = setInterval(() => mSend(0xc0, []), 30000);
+      await mSubscribe(await iTopic(myCode));
+      for (const f of friends) await mSubscribe(await pTopic(f.code));
+      publishPresence();
+      render();
+    } else if (kind === 3) {                         // PUBLISH
+      const tl = body[0] << 8 | body[1], qos = (type >> 1) & 3;
+      const topic = dec8.decode(body.slice(2, 2 + tl)), payload = body.slice(2 + tl + (qos ? 2 : 0));
+      if (topic === await iTopic(myCode)) { const o = await unseal(myCode, payload); if (o) onInbox(o); return; }
+      for (const f of friends) {
+        if (topic !== await pTopic(f.code)) continue;
+        const o = payload.length ? await unseal(f.code, payload) : null;
+        f.online = !!(o && o.t === 'here'); f.host = !!(o && o.host); f.g = o && typeof o.g === 'string' ? o.g : '';
+        if (o && o.name) { const n = cleanName(o.name); if (n !== f.name) { f.name = n; saveFriends(); } }
+        render();
+      }
+    }
+  }
+  async function publishPresence() {
+    if (!mqUp) return;
+    await mPublish(await pTopic(myCode), await seal(myCode, { t: 'here', name: myName, host: role === 'host' ? 1 : 0, g: gameId }), true);
+  }
+  async function sendInbox(code, obj) {
+    if (!mqUp) { say('Keine Verbindung zur Vermittlung.'); return; }
+    await mPublish(await iTopic(code), await seal(code, Object.assign({ from: myCode, v: PROTO }, obj)), false);
+  }
+  function mqOffline() {                             // App wird geschlossen: sauber abmelden
+    if (!mq || !mqUp) return;
+    pTopic(myCode).then((t) => { mSend(0x31, mStr(t)); mSend(0xe0, []); });
+  }
+  async function onInbox(o) {
+    const from = normCode(o.from);
+    if (!from || from === myCode || o.v !== PROTO) return;
+    if (o.t === 'join') {
+      const deny = (msg) => sendInbox(from, { t: 'deny', msg });
+      if (role !== 'host') return deny('Gerade ist keine Runde offen.');
+      if (o.g !== gameId) return deny('Andere Spielversion. Bitte beide dieselbe Version nutzen.');
+      if (!friendOf(from)) { say(cleanName(o.name) + ' möchte mitspielen: erst als Freund hinzufügen (' + showCode(from) + ').'); return deny('Du stehst nicht in der Freundesliste des Hosts.'); }
+      if (peers.size + pendingByCode.size + 1 >= MAX_PLAYERS) return deny('Die Runde ist voll.');
+      autoInvite(from);
+    } else if (o.t === 'offer') {
+      if (role !== 'guest' || joinTarget !== from || guest || typeof o.s !== 'string' || o.s.length > 16000) return;
+      guestFromOffer(from, o.s);
+    } else if (o.t === 'answer') {
+      const p = pendingByCode.get(from);
+      if (role !== 'host' || !p || typeof o.s !== 'string' || o.s.length > 16000) return;
+      pendingByCode.delete(from);
+      try { await p.pc.setRemoteDescription({ type: 'answer', sdp: o.s }); hostAttach(p.pc, p.dc); say('Verbinde …'); }
+      catch (e) { try { p.pc.close(); } catch (e2) {} }
+    } else if (o.t === 'deny') {
+      if (joinTarget === from) { say(cleanText(o.msg) || 'Beitreten abgelehnt.'); leave(true); }
+    }
+  }
+  async function autoInvite(code) {
+    const old = pendingByCode.get(code);
+    if (old) { try { old.pc.close(); } catch (e) {} }
+    const pc = new RTCPeerConnection({ iceServers: ICE }), dc = pc.createDataChannel('prisma');
+    pendingByCode.set(code, { pc, dc });
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await waitIce(pc);
+      sendInbox(code, { t: 'offer', s: pc.localDescription.sdp, g: gameId });
+    } catch (e) { pendingByCode.delete(code); return; }
+    setTimeout(() => { const p = pendingByCode.get(code); if (p && p.pc === pc) { pendingByCode.delete(code); try { pc.close(); } catch (e) {} } }, 60000);
+  }
+  function autoJoin(code) {
+    leave(true);
+    role = 'guest'; joinTarget = code;
+    const f = friendOf(code);
+    say('Frage ' + (f && f.name ? f.name : showCode(code)) + ' …');
+    sendInbox(code, { t: 'join', name: myName, g: gameId });
+    setTimeout(() => { if (joinTarget === code && !guest) { say('Keine Antwort vom Host.'); leave(true); } }, 20000);
+    render();
+  }
+  async function guestFromOffer(code, sdp) {
+    const pc = guestSetup();
+    try {
+      await pc.setRemoteDescription({ type: 'offer', sdp });
+      await pc.setLocalDescription(await pc.createAnswer());
+      await waitIce(pc);
+      if (joinTarget === code) sendInbox(code, { t: 'answer', s: pc.localDescription.sdp });
+    } catch (e) { say('Beitreten fehlgeschlagen.'); leave(true); }
+  }
+  function addFriend() {
+    const code = normCode(ui.addIn.value);
+    if (!code) { say('Ein Freundes-Code hat 8 Zeichen, z. B. ' + showCode(myCode) + '.'); return; }
+    if (code === myCode) { say('Das ist dein eigener Code.'); return; }
+    if (friendOf(code)) { say('Ist schon in der Liste.'); return; }
+    if (friends.length >= 50) { say('Die Freundesliste ist voll.'); return; }
+    friends.push({ code, name: '', online: false, host: false, g: '' });
+    saveFriends();
+    ui.addIn.value = '';
+    if (mqUp) pTopic(code).then(mSubscribe);
+    render();
+  }
+  function removeFriend(code) {
+    friends = friends.filter((f) => f.code !== code);
+    saveFriends();
+    render();
+  }
+
   // ---------------- Host ----------------
   function hostStart() {
     leave(true);
     role = 'host';
     players = [{ id: 0, name: myName }];
+    publishPresence();
     render();
   }
   async function hostInvite() {
@@ -256,13 +484,15 @@
     catch (e) { say(e.message); return; }
     pending = null;
     ui.inviteCode.value = ''; ui.answerIn.value = '';
-    const id = nextId++;
-    const peer = { pc: p.pc, dc: p.dc, name: '…' };
-    peers.set(id, peer);
-    p.dc.onmessage = (ev) => hostReceive(id, ev.data);
-    p.dc.onclose = () => hostDrop(id);
-    p.pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(p.pc.connectionState)) hostDrop(id); };
+    hostAttach(p.pc, p.dc);
     say('Verbinde …');
+  }
+  function hostAttach(pc, dc) {                      // Verbindung steht fest: als Mitspieler aufnehmen
+    const id = nextId++;
+    peers.set(id, { pc, dc, name: '…' });
+    dc.onmessage = (ev) => hostReceive(id, ev.data);
+    dc.onclose = () => hostDrop(id);
+    pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) hostDrop(id); };
     render();
   }
   function hostReceive(id, data) {
@@ -313,6 +543,18 @@
     let offer;
     try { offer = await unpack(code); }
     catch (e) { say(e.message); role = null; render(); return; }
+    const pc = guestSetup();
+    ui.answerCode.value = 'Antwort-Code wird erstellt …';
+    render();
+    try {
+      await pc.setRemoteDescription(offer);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await waitIce(pc);
+      ui.answerCode.value = await pack(pc.localDescription);
+    } catch (e) { say('Beitreten fehlgeschlagen: ' + e.message); leave(true); }
+    render();
+  }
+  function guestSetup() {                            // Gast-Verbindung anlegen (Code per Hand oder automatisch)
     const pc = new RTCPeerConnection({ iceServers: ICE });
     guest = { pc, dc: null };
     pc.ondatachannel = (ev) => {
@@ -323,15 +565,7 @@
       dc.onclose = () => { if (role === 'guest') { say('Verbindung zum Host verloren.'); leave(true); } };
     };
     pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && role === 'guest') { say('Verbindung fehlgeschlagen. Am besten beide im WLAN versuchen.'); leave(true); } };
-    ui.answerCode.value = 'Antwort-Code wird erstellt …';
-    render();
-    try {
-      await pc.setRemoteDescription(offer);
-      await pc.setLocalDescription(await pc.createAnswer());
-      await waitIce(pc);
-      ui.answerCode.value = await pack(pc.localDescription);
-    } catch (e) { say('Beitreten fehlgeschlagen: ' + e.message); leave(true); }
-    render();
+    return pc;
   }
   function guestReceive(data) {
     const o = parse(data);
@@ -369,8 +603,12 @@
     for (const p of peers.values()) { try { p.pc.close(); } catch (e) {} }
     peers.clear();
     if (guest) { try { guest.pc.close(); } catch (e) {} guest = null; }
+    for (const p of pendingByCode.values()) { try { p.pc.close(); } catch (e) {} }
+    pendingByCode.clear();
+    joinTarget = null;
     const was = role;
     role = null; players = []; ghosts.clear();
+    if (was === 'host') publishPresence();
     if (ui.inviteCode) { ui.inviteCode.value = ''; ui.answerIn.value = ''; ui.inviteIn.value = ''; ui.answerCode.value = ''; }
     if (!quiet && was) say('Runde verlassen.');
     render();
@@ -407,7 +645,10 @@
       '#net textarea{height:64px;resize:none;word-break:break-all}#net h2{font-size:14px;margin:14px 0 2px}' +
       '#net .row{display:flex;gap:8px}#net .row button{flex:1}#net .list div,#net .log div{font-size:14px;padding:3px 0}' +
       '#net .log{max-height:140px;overflow-y:auto;background:#0003;border-radius:10px;padding:6px 10px;margin:6px 0}' +
-      '#net [hidden]{display:none!important}';
+      '#net [hidden]{display:none!important}#net .code{font:bold 22px monospace;letter-spacing:2px;margin:4px 0}' +
+      '#net .fr{display:flex;align-items:center;gap:8px;padding:4px 0}#net .fr span{flex:1;font-size:14px}' +
+      '#net .fr button{width:auto;margin:0;padding:8px 12px;flex:0 0 auto}#net details{margin-top:12px}' +
+      '#net summary{cursor:pointer;color:var(--dim);font-size:13px}#net .dim{color:var(--dim);font-size:12px}';
     document.head.appendChild(style);
 
     const btn = el('button', { id: 'mNet' }, 'Mitspielen (online)');
@@ -420,11 +661,27 @@
     ui.name = c.appendChild(el('input', { maxlength: String(MAX_NAME), placeholder: 'Name', autocomplete: 'off' }));
     ui.name.value = myName;
 
-    ui.start = c.appendChild(el('div', { class: 'row' }));
+    c.appendChild(el('h2', null, 'Dein Freundes-Code'));
+    ui.myCode = c.appendChild(el('div', { class: 'code' }, showCode(myCode)));
+    const r0 = c.appendChild(el('div', { class: 'row' }));
+    ui.bCopyMine = r0.appendChild(el('button', null, 'Kopieren'));
+    ui.bShareMine = r0.appendChild(el('button', null, 'Teilen'));
+    ui.bHostAuto = c.appendChild(el('button', { class: 'main' }, 'Runde eröffnen'));
+    c.appendChild(el('h2', null, 'Freunde'));
+    ui.friends = c.appendChild(el('div'));
+    const ra = c.appendChild(el('div', { class: 'row' }));
+    ui.addIn = ra.appendChild(el('input', { maxlength: '12', placeholder: 'Freundes-Code', autocomplete: 'off', autocapitalize: 'characters' }));
+    ui.bAdd = ra.appendChild(el('button', null, 'Hinzufügen'));
+    ui.bAdd.style.flex = '0 0 120px';
+    ui.mqState = c.appendChild(el('p', { class: 'dim' }));
+
+    const det = el('details');
+    det.appendChild(el('summary', null, 'Ohne Vermittlung (Codes per Hand tauschen)'));
+    ui.start = det.appendChild(el('div', { class: 'row' }));
     ui.bHost = ui.start.appendChild(el('button', null, 'Runde eröffnen'));
     ui.bJoinShow = ui.start.appendChild(el('button', null, 'Beitreten'));
 
-    ui.host = c.appendChild(el('div'));
+    ui.host = det.appendChild(el('div'));
     ui.bInvite = ui.host.appendChild(el('button', { class: 'main' }, 'Freund einladen'));
     ui.host.appendChild(el('h2', null, '1. Diesen Code dem Freund schicken'));
     ui.inviteCode = ui.host.appendChild(el('textarea', { readonly: '' }));
@@ -435,7 +692,7 @@
     ui.answerIn = ui.host.appendChild(el('textarea', { placeholder: 'PRISMA1:…' }));
     ui.bAccept = ui.host.appendChild(el('button', null, 'Verbinden'));
 
-    ui.join = c.appendChild(el('div'));
+    ui.join = det.appendChild(el('div'));
     ui.join.appendChild(el('h2', null, '1. Einladungs-Code vom Host einfügen'));
     ui.inviteIn = ui.join.appendChild(el('textarea', { placeholder: 'PRISMA1:…' }));
     ui.bJoin = ui.join.appendChild(el('button', { class: 'main' }, 'Antwort-Code erstellen'));
@@ -456,16 +713,33 @@
     ui.bSend.style.flex = '0 0 90px';
 
     ui.bLeave = c.appendChild(el('button', null, 'Runde verlassen'));
+    c.appendChild(det);
     ui.bBack = c.appendChild(el('button', null, 'Zurück'));
     menu.appendChild(c);
     ui.card = c; ui.mainCard = mainCard; ui.joinMode = false;
 
-    btn.addEventListener('click', () => { mainCard.hidden = true; c.hidden = false; render(); });
+    btn.addEventListener('click', () => {
+      mainCard.hidden = true; c.hidden = false;
+      try { localStorage.setItem('prisma-net-on', '1'); } catch (e) {}   // ab jetzt Freunde online sehen
+      mqConnect();
+      render();
+    });
+    ui.bHostAuto.addEventListener('click', () => { ui.joinMode = false; hostStart(); });
+    ui.bAdd.addEventListener('click', addFriend);
+    ui.addIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') addFriend(); });
+    ui.bCopyMine.addEventListener('click', () => {
+      const v = showCode(myCode);
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(v).then(() => say('Code kopiert.'), () => {});
+      else say('Dein Code: ' + v);
+    });
+    ui.bShareMine.addEventListener('click', () => { if (navigator.share) navigator.share({ text: 'Mein Pokémon-Prisma-Freundes-Code: ' + showCode(myCode) }).catch(() => {}); });
+    window.addEventListener('pagehide', mqOffline);
     ui.bBack.addEventListener('click', () => { c.hidden = true; mainCard.hidden = false; });
     document.getElementById('mResume').addEventListener('click', () => { c.hidden = true; mainCard.hidden = false; });
     ui.name.addEventListener('change', () => {
       myName = cleanName(ui.name.value); ui.name.value = myName; saveName(myName);
       if (role === 'host') hostBroadcastList();
+      publishPresence();
     });
     ui.bHost.addEventListener('click', () => { ui.joinMode = false; hostStart(); });
     ui.bJoinShow.addEventListener('click', () => { leave(true); ui.joinMode = true; render(); });
@@ -479,7 +753,9 @@
     ui.bSend.addEventListener('click', chatSend);
     ui.chatIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') chatSend(); });
     ui.bLeave.addEventListener('click', () => { ui.joinMode = false; leave(false); });
-    if (!navigator.share) { ui.bShareInv.hidden = true; ui.bShareAns.hidden = true; }
+    if (!navigator.share) { ui.bShareInv.hidden = true; ui.bShareAns.hidden = true; ui.bShareMine.hidden = true; }
+    if (!window.crypto || !crypto.subtle) ui.mqState.textContent = 'Automatisches Verbinden ist auf diesem Gerät nicht möglich – nutze „Ohne Vermittlung“.';
+    mqConnect();
     if (typeof RTCPeerConnection !== 'function') { btn.disabled = true; btn.textContent = 'Mitspielen (auf diesem Gerät nicht möglich)'; }
     render();
   }
@@ -492,11 +768,27 @@
     ui.online.hidden = !inRound;
     ui.bLeave.hidden = role === null && !ui.joinMode;
     ui.status.textContent =
-      role === 'host' ? 'Du bist Host. Für jeden Freund „Freund einladen“ drücken und die Codes tauschen. Bleib in der App, sonst endet die Runde.' :
+      role === 'host' ? 'Du bist Host. Deine Freunde sehen „Runde offen“ und tippen auf Beitreten. Bleib in der App, sonst endet die Runde.' :
       connectedGuest() ? 'Verbunden mit der Runde.' :
+      role === 'guest' && joinTarget ? 'Verbinde mit dem Host …' :
       role === 'guest' ? 'Schick den Antwort-Code an den Host und warte, bis er „Verbinden“ drückt.' :
       ui.joinMode ? 'Füge den Einladungs-Code des Hosts ein.' :
-      'Spiele mit Freunden auf PC, Android oder iPhone. Einer eröffnet die Runde, die anderen treten mit einem Code bei. Am besten alle im WLAN.';
+      'Gebt euch einmal gegenseitig eure Freundes-Codes. Einer eröffnet die Runde, die anderen tippen in der Freundesliste auf Beitreten. Am besten alle im WLAN.';
+    ui.bHostAuto.hidden = role !== null;
+    if (window.crypto && crypto.subtle) ui.mqState.textContent = mqUp ? 'Vermittlung verbunden.' : 'Verbinde mit der Vermittlung …';
+    ui.friends.textContent = '';
+    if (!friends.length) ui.friends.appendChild(el('div', { class: 'dim' }, 'Noch keine Freunde. Tauscht eure Freundes-Codes aus und tragt sie unten ein.'));
+    for (const f of friends) {
+      const row = ui.friends.appendChild(el('div', { class: 'fr' }));
+      const state = !f.online ? 'offline' : f.g && f.g !== gameId ? 'andere Version' : f.host ? 'Runde offen' : 'online';
+      row.appendChild(el('span', null, (f.online ? '● ' : '○ ') + (f.name || showCode(f.code)) + ' – ' + state));
+      if (f.online && f.host && f.g === gameId && role === null) {
+        const b = row.appendChild(el('button', { class: 'main' }, 'Beitreten'));
+        b.addEventListener('click', () => autoJoin(f.code));
+      }
+      const x = row.appendChild(el('button', { title: 'Entfernen' }, '✕'));
+      x.addEventListener('click', () => { if (confirm('Freund entfernen?')) removeFriend(f.code); });
+    }
     ui.list.textContent = '';
     for (const p of players) ui.list.appendChild(el('div', null, (p.id === 0 ? '★ ' : '• ') + p.name));
     ui.log.textContent = '';
