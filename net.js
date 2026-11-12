@@ -10,6 +10,10 @@
   const MAX_PLAYERS = 8;
   const MAX_MSG = 2048, MAX_TEXT = 200, MAX_NAME = 12;
   const CODE_PREFIX = 'PRISMA1:';
+  const DEV_CODE = 'K7QM29XD', DEV_NAME = 'Marcel (Entwickler)';   // bei allen vorab in der Freundesliste
+  // Update-Hinweis: version.json legt release.sh beim Hochladen der Web-App mit ab ({ v: Version, g: Spiel-Kennung })
+  const UPDATE_URL = 'https://thatcoockie.github.io/pokemon-prisma-web/version.json';
+  let downloadUrl = '';                             // steht verschluesselt in der Spieldatei (nicht hier im Code)
 
   let gameId = '';                                   // Kennung der Spieldatei (nur gleiche Version spielt zusammen)
   let role = null;                                   // null | 'host' | 'guest'
@@ -68,6 +72,44 @@
     const v = new Uint8Array(mem(), ptr, len);
     gameId = v[0x14e].toString(16).padStart(2, '0') + v[0x14f].toString(16).padStart(2, '0');
     sheets = SHEETS.map((r) => r.map((m) => m.map((off) => decodeSheet(v, off))));
+    readLink(v).then(checkUpdate, () => {});
+  }
+  async function readLink(v) {                       // Block "PLNK" bei 0x5fff00, Schluessel aus dem Johto-Kopf
+    const LO = 0x5fff00;
+    if (v.length < LO + 0x100 || v[LO] !== 0x50 || v[LO + 1] !== 0x4c || v[LO + 2] !== 0x4e || v[LO + 3] !== 0x4b) return;
+    const n = v[LO + 4];
+    if (!n || n > 200 || !crypto.subtle) return;
+    const head = v.slice(0x200100, 0x200150), pre = enc8.encode('prisma-dl:'), m = new Uint8Array(pre.length + head.length);
+    m.set(pre); m.set(head, pre.length);
+    const seed = new Uint8Array(await crypto.subtle.digest('SHA-256', m));
+    const ks = [];
+    for (let i = 0; i < 8; i++) { const b = new Uint8Array(33); b.set(seed); b[32] = i; ks.push(...new Uint8Array(await crypto.subtle.digest('SHA-256', b))); }
+    const u = dec8.decode(Uint8Array.from(v.slice(LO + 5, LO + 5 + n), (x, i) => x ^ ks[i]));
+    if (/^https:\/\/drive\.google\.com\//.test(u)) downloadUrl = u;
+  }
+  function checkUpdate() {                           // andere Spiel-Kennung als die veroeffentlichte -> Hinweis
+    if (typeof fetch !== 'function' || !downloadUrl) return;
+    fetch(UPDATE_URL + '?t=' + Date.now(), { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+      if (j && typeof j.v === 'string' && typeof j.g === 'string' && /^[0-9a-f]{4}$/.test(j.g) && j.g !== gameId) showUpdate(j.v.slice(0, 20));
+    }).catch(() => {});
+  }
+  function showUpdate(v) {
+    if (document.getElementById('upd')) return;
+    const st = el('style');
+    st.textContent = '#upd{position:fixed;left:8px;right:8px;top:8px;z-index:50;display:flex;gap:8px;align-items:center;' +
+      'background:#203060ee;color:#fff;border-radius:12px;padding:8px 10px;font:14px system-ui}#upd span{flex:1}' +
+      '#upd button{border:0;border-radius:8px;padding:8px 10px;font:inherit}';
+    document.head.appendChild(st);
+    const b = el('div', { id: 'upd' });
+    b.appendChild(el('span', null, 'Neues Update verfügbar: ' + v));
+    const dl = b.appendChild(el('button', null, 'Herunterladen'));
+    const x = b.appendChild(el('button', { title: 'Schließen' }, '✕'));
+    dl.addEventListener('click', () => {
+      if (window.Android && typeof window.Android.openDownload === 'function') window.Android.openDownload(downloadUrl);
+      else window.open(downloadUrl, '_blank', 'noopener');
+    });
+    x.addEventListener('click', () => b.remove());
+    document.body.appendChild(b);
   }
   // Eigene Position in Pixeln: Feld x 16 plus Feinanteil aus dem Bild-Scrollen (SCX/SCY). Steht der Spieler still, wird
   // beides exakt abgeglichen; bei Spruengen (Tuer, Kartenwechsel) bleiben die Mitspieler aus, bis er einmal stillsteht.
@@ -235,7 +277,9 @@
   const ALPHA = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';  // ohne 0/O, 1/I/L
   const enc8 = new TextEncoder(), dec8 = new TextDecoder();
   let myCode = loadCode();
-  let friends = loadFriends();                       // [{ code, name, online, host, g }]
+  let friends = loadFriends();                       // [{ code, name, online, host, g, acc }]
+  let requests = loadRequests();                     // Freundschaftsanfragen: [{ code, name }]
+  addDevFriend();
   let mq = null, mqUp = false, mqPid = 1, mqPing = null, mqTimer = null, mqDelay = 3000;
   const tids = new Map(), keys = new Map();
   const pendingByCode = new Map();                   // Host: Freundes-Code -> { pc, dc } (wartet auf Antwort)
@@ -256,11 +300,60 @@
     try {
       const a = JSON.parse(localStorage.getItem('prisma-friends') || '[]');
       return Array.isArray(a) ? a.filter((f) => f && /^[2-9A-HJKMNP-Z]{8}$/.test(f.code)).slice(0, 50)
-        .map((f) => ({ code: f.code, name: cleanName(f.name), online: false, host: false, g: '' })) : [];
+        .map((f) => ({ code: f.code, name: cleanName(f.name), online: false, host: false, g: '', acc: !!f.acc })) : [];
     } catch (e) { return []; }
   }
   function saveFriends() {
-    try { localStorage.setItem('prisma-friends', JSON.stringify(friends.map((f) => ({ code: f.code, name: f.name })))); } catch (e) {}
+    try { localStorage.setItem('prisma-friends', JSON.stringify(friends.map((f) => ({ code: f.code, name: f.name, acc: f.acc ? 1 : 0 })))); } catch (e) {}
+  }
+  function addDevFriend() {                          // einmalig: Entwickler vorab eintragen (danach entfernbar)
+    let done = false;
+    try { done = localStorage.getItem('prisma-dev-added') === '1'; } catch (e) {}
+    if (done) return;
+    if (myCode !== DEV_CODE && !friends.some((f) => f.code === DEV_CODE))
+      friends.unshift({ code: DEV_CODE, name: DEV_NAME, online: false, host: false, g: '', acc: false });
+    saveFriends();
+    try { localStorage.setItem('prisma-dev-added', '1'); } catch (e) {}
+  }
+  function loadRequests() {
+    try {
+      const a = JSON.parse(localStorage.getItem('prisma-requests') || '[]');
+      return Array.isArray(a) ? a.filter((r) => r && /^[2-9A-HJKMNP-Z]{8}$/.test(r.code)).slice(0, 30)
+        .map((r) => ({ code: r.code, name: cleanName(r.name) })) : [];
+    } catch (e) { return []; }
+  }
+  function saveRequests() {
+    try { localStorage.setItem('prisma-requests', JSON.stringify(requests)); } catch (e) {}
+    badge();
+  }
+  function badge() {                                 // ! am Menuepunkt, solange Anfragen offen sind
+    const b = document.getElementById('mNet');
+    if (b) b.classList.toggle('req', requests.length > 0);
+  }
+  function addRequest(code, name) {
+    if (friendOf(code) || code === myCode) return;
+    const r = requests.find((x) => x.code === code);
+    if (r) { if (name) r.name = cleanName(name); }
+    else { requests.push({ code, name: cleanName(name) }); if (requests.length > 30) requests.shift(); say('Neue Freundschaftsanfrage von ' + (cleanName(name) || showCode(code)) + '.'); }
+    saveRequests();
+    render();
+  }
+  function acceptRequest(code) {
+    const r = requests.find((x) => x.code === code);
+    requests = requests.filter((x) => x.code !== code);
+    saveRequests();
+    if (!friendOf(code) && friends.length < 50) {
+      friends.push({ code, name: r ? r.name : '', online: false, host: false, g: '', acc: true });
+      saveFriends();
+      if (mqUp) pTopic(code).then(mSubscribe);
+    }
+    sendInbox(code, { t: 'acc', name: myName });
+    render();
+  }
+  function rejectRequest(code) {
+    requests = requests.filter((x) => x.code !== code);
+    saveRequests();
+    render();
   }
   function normCode(s) {
     const c = String(s || '').toUpperCase().replace(/O/g, '0').split('').filter((ch) => ALPHA.includes(ch)).join('');
@@ -366,6 +459,7 @@
         const o = payload.length ? await unseal(f.code, payload) : null;
         f.online = !!(o && o.t === 'here'); f.host = !!(o && o.host); f.g = o && typeof o.g === 'string' ? o.g : '';
         if (o && o.name) { const n = cleanName(o.name); if (n !== f.name) { f.name = n; saveFriends(); } }
+        if (f.online && !f.acc && !f.reqSent) { f.reqSent = true; sendInbox(f.code, { t: 'req', name: myName }); }   // Anfrage (kommt nur an, wenn er online ist)
         render();
       }
     }
@@ -389,7 +483,7 @@
       const deny = (msg) => sendInbox(from, { t: 'deny', msg });
       if (role !== 'host') return deny('Gerade ist keine Runde offen.');
       if (o.g !== gameId) return deny('Andere Spielversion. Bitte beide dieselbe Version nutzen.');
-      if (!friendOf(from)) { say(cleanName(o.name) + ' möchte mitspielen: erst als Freund hinzufügen (' + showCode(from) + ').'); return deny('Du stehst nicht in der Freundesliste des Hosts.'); }
+      if (!friendOf(from)) { addRequest(from, o.name); return deny('Der Host muss deine Freundschaftsanfrage erst annehmen.'); }
       if (peers.size + pendingByCode.size + 1 >= MAX_PLAYERS) return deny('Die Runde ist voll.');
       autoInvite(from);
     } else if (o.t === 'offer') {
@@ -401,6 +495,13 @@
       pendingByCode.delete(from);
       try { await p.pc.setRemoteDescription({ type: 'answer', sdp: o.s }); hostAttach(p.pc, p.dc); say('Verbinde …'); }
       catch (e) { try { p.pc.close(); } catch (e2) {} }
+    } else if (o.t === 'req') {
+      const f = friendOf(from);
+      if (f) { if (!f.acc) { f.acc = true; saveFriends(); } sendInbox(from, { t: 'acc', name: myName }); }   // schon befreundet
+      else addRequest(from, o.name);
+    } else if (o.t === 'acc') {
+      const f = friendOf(from);
+      if (f && !f.acc) { f.acc = true; saveFriends(); render(); }
     } else if (o.t === 'deny') {
       if (joinTarget === from) { say(cleanText(o.msg) || 'Beitreten abgelehnt.'); leave(true); }
     }
@@ -648,7 +749,9 @@
       '#net [hidden]{display:none!important}#net .code{font:bold 22px monospace;letter-spacing:2px;margin:4px 0}' +
       '#net .fr{display:flex;align-items:center;gap:8px;padding:4px 0}#net .fr span{flex:1;font-size:14px}' +
       '#net .fr button{width:auto;margin:0;padding:8px 12px;flex:0 0 auto}#net details{margin-top:12px}' +
-      '#net summary{cursor:pointer;color:var(--dim);font-size:13px}#net .dim{color:var(--dim);font-size:12px}';
+      '#net summary{cursor:pointer;color:var(--dim);font-size:13px}#net .dim{color:var(--dim);font-size:12px}' +
+      '#mNet.req::after{content:" !";color:#ff5050;font-weight:bold;animation:netblink 1s steps(1) infinite}' +
+      '@keyframes netblink{50%{opacity:0}}';
     document.head.appendChild(style);
 
     const btn = el('button', { id: 'mNet' }, 'Mitspielen (online)');
@@ -667,6 +770,8 @@
     ui.bCopyMine = r0.appendChild(el('button', null, 'Kopieren'));
     ui.bShareMine = r0.appendChild(el('button', null, 'Teilen'));
     ui.bHostAuto = c.appendChild(el('button', { class: 'main' }, 'Runde eröffnen'));
+    ui.reqHead = c.appendChild(el('h2', null, 'Anfragen'));
+    ui.reqs = c.appendChild(el('div'));
     c.appendChild(el('h2', null, 'Freunde'));
     ui.friends = c.appendChild(el('div'));
     const ra = c.appendChild(el('div', { class: 'row' }));
@@ -789,6 +894,17 @@
       const x = row.appendChild(el('button', { title: 'Entfernen' }, '✕'));
       x.addEventListener('click', () => { if (confirm('Freund entfernen?')) removeFriend(f.code); });
     }
+    ui.reqs.textContent = '';
+    ui.reqHead.hidden = ui.reqs.hidden = !requests.length;
+    for (const r of requests) {
+      const row = ui.reqs.appendChild(el('div', { class: 'fr' }));
+      row.appendChild(el('span', null, (r.name || showCode(r.code)) + ' möchte dein Freund sein'));
+      const a = row.appendChild(el('button', { class: 'main' }, 'Annehmen'));
+      a.addEventListener('click', () => acceptRequest(r.code));
+      const x = row.appendChild(el('button', { title: 'Ablehnen' }, '✕'));
+      x.addEventListener('click', () => rejectRequest(r.code));
+    }
+    badge();
     ui.list.textContent = '';
     for (const p of players) ui.list.appendChild(el('div', null, (p.id === 0 ? '★ ' : '• ') + p.name));
     ui.log.textContent = '';
