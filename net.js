@@ -89,7 +89,12 @@
   }
   function checkUpdate() {                           // andere Spiel-Kennung als die veroeffentlichte -> Hinweis
     if (typeof fetch !== 'function' || !downloadUrl) return;
-    fetch(UPDATE_URL + '?t=' + Date.now(), { cache: 'no-store' }).then((r) => r.json()).then((j) => {
+    fetch(UPDATE_URL + '?t=' + Date.now(), { cache: 'no-store' }).then((r) => {
+      // Uhr-Schutz: Serverzeit (nur lesbar, wenn die Seite selbst auf github.io laeuft) -> Abweichung der Geraete-Uhr
+      const d = Date.parse(r.headers.get('Date') || '');
+      if (d && core && typeof core.wc_set_clock_offset === 'function') core.wc_set_clock_offset(Math.round((d - Date.now()) / 1000));
+      return r.json();
+    }).then((j) => {
       if (j && typeof j.v === 'string' && typeof j.g === 'string' && /^[0-9a-f]{4}$/.test(j.g) && j.g !== gameId) showUpdate(j.v.slice(0, 20));
     }).catch(() => {});
   }
